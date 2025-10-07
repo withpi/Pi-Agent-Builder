@@ -6,5 +6,3 @@ export interface EvaluationRubricItem {
   toolName: string | null
   timestamp: Date
 }
-
-
