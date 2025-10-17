@@ -1,6 +1,6 @@
 "use client"
 
-import { createContext, useContext, useState, type ReactNode } from "react"
+import { createContext, useContext, useState, useRef, useEffect, type ReactNode } from "react"
 import PiClient from "withpi"
 import Question = PiClient.Question
 import { transformFeedbackToQuestion } from "@/lib/rubric/feedbackToQuestion"
@@ -96,7 +96,7 @@ interface AgentContextType {
   currentConfig: AgentConfig
   currentTrace: AgentTrace | null
   updateConfig: (id: string, updates: Partial<AgentConfig>) => void
-  setCurrentConfig: (config: AgentConfig | null) => void
+  setCurrentConfig: (config: AgentConfig) => void
   findOrCreateConfig: (
     model: string,
     systemPrompt: string,
@@ -121,6 +121,19 @@ interface AgentContextType {
   getRubricsByToolNameAndType: (toolName: string, rubricType: "tool-call" | "tool-result") => Rubric[]
   scoreStep: (step: AgentStep, trace: AgentTrace, rubric?: Rubric) => Promise<StepScore | null>
   rescoreStepsForRubric: (rubric: Rubric) => Promise<void>
+  // Streaming state and functions
+  isStreaming: boolean
+  streamingSteps: Map<string, {
+    type: string
+    content: string
+    toolName?: string
+    toolInput?: any
+    toolOutput?: any
+    toolCallId?: string
+  }>
+  finalizedStepIds: Set<string>
+  startStreaming: (inputValue: string, usePiJudge: boolean, rubrics: any[]) => Promise<void>
+  stopStreaming: () => void
 }
 
 const AgentContext = createContext<AgentContextType | undefined>(undefined)
@@ -173,6 +186,24 @@ Your goal: find, distill, and clearly attribute the most relevant and reliable i
     createdAt: Date.now(),
   })
   const [currentTrace, setCurrentTrace] = useState<AgentTrace | null>(null)
+  
+  // Streaming state
+  const [isStreaming, setIsStreaming] = useState(false)
+  const [streamingSteps, setStreamingSteps] = useState<Map<string, {
+    type: string
+    content: string
+    toolName?: string
+    toolInput?: any
+    toolOutput?: any
+    toolCallId?: string
+  }>>(new Map())
+  const [finalizedStepIds, setFinalizedStepIds] = useState<Set<string>>(new Set())
+  
+  // Refs for streaming management
+  const pendingStepsRef = useRef<Array<{ traceId: string; step: any; stepId: string }>>([])
+  const isProcessingRef = useRef(false)
+  const addedStepIdsRef = useRef<Set<string>>(new Set())
+  const abortControllerRef = useRef<AbortController | null>(null)
 
   const addConfig = (config: Omit<AgentConfig, "id" | "createdAt">) => {
     const newConfig: AgentConfig = {
@@ -187,7 +218,7 @@ Your goal: find, distill, and clearly attribute the most relevant and reliable i
   const updateConfig = (id: string, updates: Partial<AgentConfig>) => {
     // The configs array should only be modified when running the agent via findOrCreateConfig
     if (currentConfig?.id === id) {
-      setCurrentConfig((prev) => (prev ? { ...prev, ...updates } : null))
+      setCurrentConfig((prev) => ({ ...prev, ...updates }))
     }
   }
 
@@ -686,6 +717,317 @@ Your goal: find, distill, and clearly attribute the most relevant and reliable i
     })
   }
 
+  // Effect to process pending steps
+  useEffect(() => {
+    if (isProcessingRef.current || pendingStepsRef.current.length === 0) {
+      return
+    }
+
+    isProcessingRef.current = true
+
+    const stepsToAdd = [...pendingStepsRef.current]
+    pendingStepsRef.current = []
+
+    console.log("[v0] Processing pending steps:", stepsToAdd.length)
+
+    stepsToAdd.forEach(async ({ traceId, step, stepId }) => {
+      if (addedStepIdsRef.current.has(stepId)) {
+        console.log("[v0] Skipping duplicate step:", stepId)
+        return
+      }
+
+      console.log("[v0] Adding step to trace:", stepId, step.type)
+      addStepToTrace(traceId, step)
+      addedStepIdsRef.current.add(stepId)
+
+      if (
+        step.type === "ACTION" ||
+        step.type === "OBSERVATION" ||
+        step.type === "RESPONSE" ||
+        step.type === "THINKING"
+      ) {
+        console.log("[v0] Scoring step:", stepId, step.type)
+
+        let rubric
+
+        if (step.type === "RESPONSE") {
+          const rubrics = getRubricsByStepType("RESPONSE")
+          rubric = rubrics[rubrics.length - 1]
+          console.log("[v0] Found RESPONSE rubric:", rubric?.id, "with", rubric?.questions.length, "questions")
+        } else if (step.type === "THINKING") {
+          const rubrics = getRubricsByStepType("THINKING")
+          rubric = rubrics[rubrics.length - 1]
+          console.log("[v0] Found THINKING rubric:", rubric?.id, "with", rubric?.questions.length, "questions")
+        } else if (step.type === "ACTION" && step.toolName) {
+          const rubrics = getRubricsByToolNameAndType(step.toolName, "tool-call")
+          rubric = rubrics[rubrics.length - 1]
+          console.log(
+            "[v0] Found ACTION rubric for",
+            step.toolName,
+            ":",
+            rubric?.id,
+            "with",
+            rubric?.questions.length,
+            "questions",
+          )
+        } else if (step.type === "OBSERVATION" && step.toolName) {
+          const rubrics = getRubricsByToolNameAndType(step.toolName, "tool-result")
+          rubric = rubrics[rubrics.length - 1]
+          console.log(
+            "[v0] Found OBSERVATION rubric for",
+            step.toolName,
+            ":",
+            rubric?.id,
+            "with",
+            rubric?.questions.length,
+            "questions",
+          )
+        }
+
+        if (rubric && rubric.questions.length > 0 && currentTrace) {
+          console.log("[v0] Calling scoreStep for", stepId, "with rubric", rubric.id)
+
+          // Get the full trace with the newly added step
+          const fullStep = { ...step, timestamp: Date.now() }
+          const updatedTrace = {
+            ...currentTrace,
+            steps: [...currentTrace.steps, fullStep],
+          }
+
+          const score = await scoreStep(fullStep, updatedTrace, rubric)
+
+          if (score) {
+            console.log("[v0] Score received:", score.total, "- updating state")
+            updateStepScore(traceId, stepId, score)
+          }
+        } else {
+          console.log("[v0] No rubric found or rubric has no questions for step", stepId)
+        }
+      }
+    })
+
+    isProcessingRef.current = false
+  }, [
+    streamingSteps,
+    addStepToTrace,
+    updateStepScore,
+    scoreStep,
+    getRubricsByStepType,
+    getRubricsByToolNameAndType,
+    currentTrace,
+  ])
+
+  const startStreaming = async (inputValue: string, usePiJudge: boolean, rubrics: any[]) => {
+    if (!inputValue.trim() || !currentConfig) return
+
+    setIsStreaming(true)
+    setStreamingSteps(new Map())
+    setFinalizedStepIds(new Set())
+    pendingStepsRef.current = []
+    addedStepIdsRef.current = new Set()
+    isProcessingRef.current = false
+
+    // Cancel any existing request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    
+    abortControllerRef.current = new AbortController()
+
+    const activeConfig = findOrCreateConfig(
+      currentConfig.model,
+      currentConfig.systemPrompt,
+      currentConfig.toolSlugs,
+      usePiJudge,
+      rubrics,
+    )
+
+    // Update current config if it changed
+    if (activeConfig.id !== currentConfig.id) {
+      setCurrentConfig(activeConfig)
+    }
+
+    // Create new trace with the active config
+    const trace = addTrace({
+      configId: activeConfig.id,
+      input: inputValue.trim(),
+      steps: [],
+      status: "running",
+    })
+
+    setCurrentTrace(trace)
+
+    try {
+      let rubricsToSend: any[] = []
+      if (usePiJudge) {
+        rubricsToSend = rubrics.filter((rubric) => {
+          // Include response rubrics (final response evaluation)
+          if (rubric.rubricType === "response") {
+            return true
+          }
+
+          // Include thinking rubrics
+          if (rubric.rubricType === "thinking") {
+            return true
+          }
+
+          // Include tool-specific rubrics that match the app slugs
+          if (!rubric.toolName) return false
+          return activeConfig.toolSlugs.some(
+            (appSlug) => rubric.toolName == appSlug,
+          )
+        })
+        console.log(
+          "[v0] Sending rubrics to agent:",
+          rubricsToSend.length,
+          "including response rubrics:",
+          rubricsToSend.filter((r) => r.rubricType === "response").length,
+          "thinking rubrics:",
+          rubricsToSend.filter((r) => r.rubricType === "thinking").length,
+        )
+      }
+
+      const response = await fetch("/api/agent/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          config: activeConfig,
+          input: inputValue.trim(),
+          traceId: trace.id,
+          toolNames: activeConfig.toolSlugs,
+          usePiJudge,
+          rubrics: rubricsToSend,
+        }),
+        signal: abortControllerRef.current.signal,
+      })
+
+      if (!response.ok) throw new Error("Failed to run agent")
+
+      const reader = response.body?.getReader()
+      if (!reader) throw new Error("No reader available")
+
+      const decoder = new TextDecoder()
+      let buffer = ""
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split("\n")
+        buffer = lines.pop() || ""
+
+        for (const line of lines) {
+          if (line.startsWith("data: ")) {
+            try {
+              const data = JSON.parse(line.slice(6))
+
+              if (data.type === "step-start") {
+                // Initialize a new streaming step
+                console.log("[v0] Step start:", data.stepId, data.stepType)
+                setStreamingSteps((prev) => {
+                  const next = new Map(prev)
+                  next.set(data.stepId, {
+                    type: data.stepType,
+                    content: "",
+                    toolName: data.toolName,
+                    toolInput: data.toolInput,
+                    toolOutput: data.toolOutput,
+                    toolCallId: data.toolCallId,
+                  })
+                  return next
+                })
+              } else if (data.type === "token") {
+                setStreamingSteps((prev) => {
+                  const next = new Map(prev)
+                  const step = next.get(data.stepId)
+                  if (step) {
+                    next.set(data.stepId, {
+                      ...step,
+                      content: step.content + data.delta,
+                    })
+                  }
+                  return next
+                })
+              } else if (data.type === "step-type-change") {
+                console.log("[v0] Step type change:", data.stepId, "to", data.newStepType)
+                setStreamingSteps((prev) => {
+                  const next = new Map(prev)
+                  const step = next.get(data.stepId)
+                  if (step) {
+                    next.set(data.stepId, {
+                      ...step,
+                      type: data.newStepType,
+                    })
+                  }
+                  return next
+                })
+              } else if (data.type === "step-end") {
+                console.log("[v0] Step end:", data.stepId)
+                setFinalizedStepIds((prev) => new Set(prev).add(data.stepId))
+
+                setStreamingSteps((prev) => {
+                  const streamingStep = prev.get(data.stepId)
+
+                  if (streamingStep) {
+                    console.log("[v0] Queueing step:", data.stepId, streamingStep.type)
+                    pendingStepsRef.current.push({
+                      traceId: trace.id,
+                      stepId: data.stepId,
+                      step: {
+                        id: data.stepId,
+                        type: streamingStep.type as any,
+                        content: streamingStep.content,
+                        toolName: streamingStep.toolName,
+                        toolInput: streamingStep.toolInput,
+                        toolOutput: streamingStep.toolOutput,
+                        toolCallId: streamingStep.toolCallId,
+                      },
+                    })
+                  }
+
+                  // Remove from streaming steps
+                  const next = new Map(prev)
+                  next.delete(data.stepId)
+                  return next
+                })
+              } else if (data.type === "step") {
+                // Legacy support for old step format
+                console.log("[v0] Received step:", data.step)
+                addStepToTrace(trace.id, data.step)
+              } else if (data.type === "complete") {
+                updateTrace(trace.id, { status: "completed" })
+              } else if (data.type === "error") {
+                updateTrace(trace.id, { status: "error" })
+              }
+            } catch (e) {
+              console.error("Failed to parse SSE data:", e)
+            }
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Error running agent:", error)
+      if (currentTrace) {
+        updateTrace(currentTrace.id, { status: "error" })
+      }
+    } finally {
+      setIsStreaming(false)
+      setStreamingSteps(new Map())
+      setFinalizedStepIds(new Set())
+    }
+  }
+
+  const stopStreaming = () => {
+    setIsStreaming(false)
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+    }
+    if (currentTrace) {
+      updateTrace(currentTrace.id, { status: "completed" })
+    }
+  }
+
   return (
     <AgentContext.Provider
       value={{
@@ -714,6 +1056,12 @@ Your goal: find, distill, and clearly attribute the most relevant and reliable i
         getRubricsByToolNameAndType,
         scoreStep,
         rescoreStepsForRubric,
+        // Streaming state and functions
+        isStreaming,
+        streamingSteps,
+        finalizedStepIds,
+        startStreaming,
+        stopStreaming,
       }}
     >
       {children}
